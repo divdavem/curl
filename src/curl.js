@@ -19,19 +19,9 @@
 		prevCurl,
 		define,
 		doc = global.document,
-		head = doc && (doc['head'] || doc.getElementsByTagName('head')[0]),
-		// to keep IE from crying, we need to put scripts before any
-		// <base> elements, but after any <meta>. this should do it:
-		insertBeforeEl = head && head.getElementsByTagName('base')[0] || null,
 		// constants / flags
 		msgUsingExports = {},
 		msgFactoryExecuted = {},
-		// this is the list of scripts that IE is loading. one of these will
-		// be the "interactive" script. too bad IE doesn't send a readystatechange
-		// event to tell us exactly which one.
-		activeScripts = {},
-		// readyStates for IE6-9
-		readyStates = 'addEventListener' in global ? {} : { 'loaded': 1, 'complete': 1 },
 		// these are always handy :)
 		cleanPrototype = {},
 		toString = cleanPrototype.toString,
@@ -48,8 +38,26 @@
 		findLeadingDotsRx = /(\.)(\.?)(?:$|\/([^\.\/]+.*)?)/g, // /(?:^|\/)(\.)(\.?)\/?/g,
 		removeCommentsRx = /\/\*[\s\S]*?\*\/|(?:[^\\])\/\/.*?[\n\r]/g,
 		findRValueRequiresRx = /require\s*\(\s*["']([^"']+)["']\s*\)|(?:[^\\]?)(["'])/g,
+        defineWrapperRx = /^\s*define\s*\(/,
 		cjsGetters,
-		core;
+		core,
+        HTTPRequestObject = global.XMLHttpRequest,
+        newXMLHttpRequest;
+
+    if (HTTPRequestObject) {
+        newXMLHttpRequest = function() {
+            return new HTTPRequestObject();
+        }
+    } else {
+        HTTPRequestObject = global.ActiveXObject;
+        newXMLHttpRequest = function() {
+            return new HTTPRequestObject("Microsoft.XMLHTTP");
+        }
+    }
+
+    function exec(code) {
+        eval(code);
+    }
 
 	function noop () {}
 
@@ -608,55 +616,43 @@
 		},
 
 		loadScript: function (def, success, failure) {
-			// script processing rules learned from RequireJS
+            var xhr = newXMLHttpRequest();
 
-			// insert script
-			var el = doc.createElement('script');
+            function process () {
+                if (xhr && xhr.readyState == 4) {
+                    var error = (xhr.status != 200);
+                    var errorDetails = xhr.statusText;
+                    var jsCode = xhr.responseText;
+                    if (!error) {
+                        try{
+                            if (!defineWrapperRx.test(jsCode.replace(removeCommentsRx,''))) {
+                                jsCode = ['define(function(require,exports,module){\n',jsCode,'\n});\n//@ sourceURL=', def.url].join('');
+                            } else {
+                                jsCode = [jsCode, '\n//@ sourceURL=', def.url].join('');
+                            }
+                            exec(jsCode);
+                        } catch (e){
+                            error = true;
+                            errorDetails = ''+e;
+                        }
+                    }
+                    xhr.onreadystatechange = ''; // IE does not accept null here
+                    xhr = null;
+                    if (error) {
+                        failure(new Error('Syntax or http error: ' + def.url + '\n' + errorDetails));
+                    } else {
+                        success();
+                    }
+                    // nullify variables from the closure
+                    def = null;
+                    success = null;
+                    failure = null;
+                }
+            }
 
-			// initial script processing
-			function process (ev) {
-				ev = ev || global.event;
-				// detect when it's done loading
-				// ev.type == 'load' is for all browsers except IE6-9
-				// IE6-9 need to use onreadystatechange and look for
-				// el.readyState in {loaded, complete} (yes, we need both)
-				if (ev.type == 'load' || readyStates[el.readyState]) {
-					delete activeScripts[def.id];
-					// release event listeners
-					el.onload = el.onreadystatechange = el.onerror = ''; // ie cries if we use undefined
-					success();
-				}
-			}
-
-			function fail (e) {
-				// some browsers send an event, others send a string,
-				// but none of them send anything useful, so just say we failed:
-				failure(new Error('Syntax or http error: ' + def.url));
-			}
-
-			// set type first since setting other properties could
-			// prevent us from setting this later
-			// actually, we don't even need to set this at all
-			//el.type = 'text/javascript';
-			// using dom0 event handlers instead of wordy w3c/ms
-			el.onload = el.onreadystatechange = process;
-			el.onerror = fail;
-			// js! plugin uses alternate mimetypes
-			el.type = def.mimetype || 'text/javascript';
-			// TODO: support other charsets?
-			el.charset = 'utf-8';
-			el.async = !def.order;
-			el.src = def.url;
-
-			// loading will start when the script is inserted into the dom.
-			// IE will load the script sync if it's in the cache, so
-			// indicate the current resource definition if this happens.
-			activeScripts[def.id] = el;
-
-			head.insertBefore(el, insertBeforeEl);
-
-			// the js! plugin uses this
-			return el;
+            xhr.open('GET', def.url, true);
+            xhr.onreadystatechange = process;
+            xhr.send(null);
 		},
 
 		extractCjsDeps: function (defFunc) {
@@ -1013,24 +1009,6 @@
 
 			// return tempDef if this is a plugin-based resource
 			return tempDef || def;
-		},
-
-		getCurrentDefName: function () {
-			// IE6-9 mark the currently executing thread as "interactive"
-			// Note: Opera lies about which scripts are "interactive", so we
-			// just have to test for it. Opera provides a true browser test, not
-			// a UA sniff, thankfully.
-			// learned this trick from James Burke's RequireJS
-			var def;
-			if (!isType(global.opera, 'Opera')) {
-				for (var d in activeScripts) {
-					if (activeScripts[d].readyState == 'interactive') {
-						def = d;
-						break;
-					}
-				}
-			}
-			return def;
 		}
 
 	};
@@ -1088,7 +1066,7 @@
 			if (argsNet !== undef) {
 				argsNet = {ex: 'Multiple anonymous defines in url'};
 			}
-			else if (!(id = core.getCurrentDefName())/* intentional assignment */) {
+			else {
 				// anonymous define(), defer processing until after script loads
 				argsNet = args;
 			}
